@@ -1,0 +1,349 @@
+# Put these three SCRIPT KEYS inside Home Assistant scripts.yaml (no outer "script:").
+# Tag name in Home Assistant: HMH_Device (entity-level or device-level).
+# No access token, REST endpoint, MQTT broker or extra integration needed.
+
+hmh_knob_catalog:
+  alias: "HMH Knob - Catalogo dispositivi"
+  description: "Scopre fino a 24 dispositivi, uno per device_id, scegliendo il controllo principale."
+  mode: single
+  sequence:
+    - variables:
+        result:
+          payload: >-
+            {#
+              HMH Universal Knob 0.1.1 - una pagina per dispositivo fisico.
+              1) Etichetta su ENTITA': preferenza esplicita per quel controllo.
+              2) Etichetta su DISPOSITIVO: selezione automatica controllo principale.
+              3) Sensori collegati al medesimo device_id restano telemetria.
+            #}
+            {% set domains = ['light','switch','climate','cover','fan','media_player','input_boolean','scene','script','sensor'] %}
+            {% set weights = dict(climate=145, cover=145, light=130, switch=120, fan=135, media_player=135, input_boolean=100, scene=90, script=90, sensor=20) %}
+            {% set explicit = label_entities('HMH_Device') | list %}
+            {% set marked_devices = label_devices('HMH_Device') | list %}
+            {% set ns = namespace(devices=marked_devices, roots=[]) %}
+            {# Le entita' esplicitamente etichettate e collegate a un device rientrano
+               nella stessa pagina fisica; senza device_id diventano pagine autonome. #}
+            {% for e in explicit | sort %}
+              {% if e.split('.')[0] in domains %}
+                {% set dev = device_id(e) %}
+                {% if dev is none %}
+                  {% set ns.roots = ns.roots + [dict(entity=e, name=state_attr(e,'friendly_name') or e)] %}
+                {% elif dev not in ns.devices %}
+                  {% set ns.devices = ns.devices + [dev] %}
+                {% endif %}
+              {% endif %}
+            {% endfor %}
+            {% for dev in ns.devices | unique | sort %}
+              {% set tagged = namespace(entities=[]) %}
+              {% for e in device_entities(dev) | sort %}
+                {% if e in explicit and e.split('.')[0] in domains %}
+                  {% set tagged.entities = tagged.entities + [e] %}
+                {% endif %}
+              {% endfor %}
+              {# Se l'utente ha etichettato anche un'entita', essa prevale
+                 su tutte le altre funzioni dello stesso dispositivo. #}
+              {% set candidates = tagged.entities if tagged.entities | count else device_entities(dev) | list %}
+              {% set pick = namespace(entity=none, score=-10000) %}
+              {% for e in candidates | sort %}
+                {% set domain = e.split('.')[0] %}
+                {% if domain in domains %}
+                  {% set title = (state_attr(e,'friendly_name') or e) | lower %}
+                  {% set key = e | lower %}
+                  {% set score = weights[domain] %}
+                  {% if ('led ' in title or title.endswith(' led') or '_led' in key or 'indicator' in title or 'spia' in title) %}
+                    {% set score = score - 105 %}
+                  {% endif %}
+                  {% if domain == 'switch' and ('relay' in key or 'relay' in title or 'relè' in title or 'rele' in title or 'rel_' in key or 'presa' in title or 'outlet' in title or 'plug' in title) %}
+                    {% set score = score + 45 %}
+                  {% endif %}
+                  {% if domain == 'sensor' and state_attr(e,'device_class') in ['temperature','power','humidity','energy','voltage','current'] %}
+                    {% set score = score + 15 %}
+                  {% endif %}
+                  {% if states(e) in ['unavailable','unknown'] %}
+                    {% set score = score - 10 %}
+                  {% endif %}
+                  {% if score > pick.score %}
+                    {% set pick.entity = e %}
+                    {% set pick.score = score %}
+                  {% endif %}
+                {% endif %}
+              {% endfor %}
+              {% if pick.entity is not none %}
+                {% set n = device_name(dev) if dev in marked_devices else none %}
+                {% set n = n or state_attr(pick.entity,'friendly_name') or pick.entity %}
+                {% set ns.roots = ns.roots + [dict(entity=pick.entity, name=n)] %}
+              {% endif %}
+            {% endfor %}
+            {% set out = namespace(cards=[]) %}
+            {% for item in ns.roots %}
+              {% set e = item.entity %}
+              {% set domain = e.split('.')[0] %}
+              {% if domain in domains and out.cards | count < 24 %}
+                {% set modes = state_attr(e, 'supported_color_modes') or [] %}
+                {% set features = state_attr(e, 'supported_features') | int(0) %}
+                {% set hvac = state_attr(e, 'hvac_modes') or [] %}
+                {% set dim = domain == 'light' and (modes | reject('eq','onoff') | list | count > 0) %}
+                {% set rgb = domain == 'light' and (('hs' in modes) or ('rgb' in modes) or ('rgbw' in modes) or ('rgbww' in modes) or ('xy' in modes)) %}
+                {% set ct = domain == 'light' and 'color_temp' in modes %}
+                {% set card = dict(
+                    entity=e,
+                    name=item.name,
+                    domain=domain,
+                    features=features,
+                    modes=hvac | join(','),
+                    dim=dim,
+                    color=rgb,
+                    kelvin=ct,
+                    min_temp=state_attr(e, 'min_temp') | float(7),
+                    max_temp=state_attr(e, 'max_temp') | float(35),
+                    temp_step=state_attr(e, 'target_temp_step') | float(0.5),
+                    min_kelvin=state_attr(e, 'min_color_temp_kelvin') | float(2000),
+                    max_kelvin=state_attr(e, 'max_color_temp_kelvin') | float(6500)
+                ) %}
+                {% set out.cards = out.cards + [card] %}
+              {% endif %}
+            {% endfor %}
+            {{ out.cards | sort(attribute='name') | to_json }}
+    - stop: "Restituisco catalogo HMH Knob"
+      response_variable: result
+
+hmh_knob_state:
+  alias: "HMH Knob - Stato dispositivo"
+  description: "Restituisce stato principale e misure delle entita' sullo stesso device."
+  mode: parallel
+  max: 4
+  fields:
+    entity_id:
+      required: true
+      selector:
+        text: {}
+  sequence:
+    - variables:
+        result:
+          payload: >-
+            {% set label_entity = label_entities('HMH_Device') %}
+            {% set label_device = label_devices('HMH_Device') %}
+            {% set dev = device_id(entity_id) %}
+            {% set valid = entity_id in label_entity or (dev is not none and dev in label_device) %}
+            {% if not valid %}
+              {{ dict(entity=entity_id,state='unavailable') | to_json }}
+            {% else %}
+              {% set aux = namespace(power=none, voltage=none, current=none, energy=none, pf=none, temp=none, hum=none,
+                                  power_unit='',voltage_unit='',current_unit='',energy_unit='') %}
+              {% if dev is not none %}
+                {% for sid in device_entities(dev) %}
+                  {% set cls = state_attr(sid,'device_class') %}
+                  {% if sid.startswith('sensor.') and states(sid) not in ['unavailable','unknown','none'] %}
+                    {% if cls == 'power' and aux.power is none %}{% set aux.power = states(sid) %}{% set aux.power_unit = state_attr(sid,'unit_of_measurement') or '' %}{% endif %}
+                    {% if cls == 'voltage' and aux.voltage is none %}{% set aux.voltage = states(sid) %}{% set aux.voltage_unit = state_attr(sid,'unit_of_measurement') or '' %}{% endif %}
+                    {% if cls == 'current' and aux.current is none %}{% set aux.current = states(sid) %}{% set aux.current_unit = state_attr(sid,'unit_of_measurement') or '' %}{% endif %}
+                    {% if cls == 'energy' and aux.energy is none %}{% set aux.energy = states(sid) %}{% set aux.energy_unit = state_attr(sid,'unit_of_measurement') or '' %}{% endif %}
+                    {% if cls == 'power_factor' and aux.pf is none %}{% set aux.pf = states(sid) %}{% endif %}
+                    {% if cls == 'temperature' and aux.temp is none %}{% set aux.temp = states(sid) %}{% endif %}
+                    {% if cls == 'humidity' and aux.hum is none %}{% set aux.hum = states(sid) %}{% endif %}
+                  {% endif %}
+                {% endfor %}
+              {% endif %}
+              {% set raw_bright = state_attr(entity_id,'brightness') %}
+              {% set hs = state_attr(entity_id,'hs_color') %}
+              {% set v = state_attr(entity_id,'volume_level') %}
+              {% set temp = state_attr(entity_id,'current_temperature') %}
+              {% set hum = state_attr(entity_id,'current_humidity') %}
+              {% set record = dict(
+                  entity=entity_id,
+                  state=states(entity_id),
+                  hvac_mode=states(entity_id),
+                  brightness=((raw_bright | float(0)) * 100 / 255) | round(0) if raw_bright is not none else none,
+                  hue=hs[0] if hs is not none and hs | count > 0 else none,
+                  saturation=hs[1] if hs is not none and hs | count > 1 else none,
+                  kelvin=state_attr(entity_id,'color_temp_kelvin'),
+                  target=state_attr(entity_id,'temperature'),
+                  temperature=temp if temp is not none else aux.temp,
+                  humidity=hum if hum is not none else aux.hum,
+                  position=state_attr(entity_id,'current_position'),
+                  speed=state_attr(entity_id,'percentage'),
+                  volume=((v | float(0)) * 100) | round(0) if v is not none else none,
+                  muted=state_attr(entity_id,'is_volume_muted') or false,
+                  power=state_attr(entity_id,'power') if state_attr(entity_id,'power') is not none else aux.power,
+                  voltage=state_attr(entity_id,'voltage') if state_attr(entity_id,'voltage') is not none else aux.voltage,
+                  current=state_attr(entity_id,'current') if state_attr(entity_id,'current') is not none else aux.current,
+                  energy=state_attr(entity_id,'energy') if state_attr(entity_id,'energy') is not none else aux.energy,
+                  power_factor=state_attr(entity_id,'power_factor') if state_attr(entity_id,'power_factor') is not none else aux.pf,
+                  power_unit=aux.power_unit, voltage_unit=aux.voltage_unit,
+                  current_unit=aux.current_unit, energy_unit=aux.energy_unit
+              ) %}
+              {{ record | to_json }}
+            {% endif %}
+    - stop: "Restituisco stato HMH Knob"
+      response_variable: result
+
+hmh_knob_command:
+  alias: "HMH Knob - Comando validato"
+  description: "Esegue SOLO comandi espliciti su entita' coperte da etichetta HMH_Device."
+  mode: queued
+  max: 5
+  fields:
+    entity_id:
+      required: true
+      selector:
+        text: {}
+    operation:
+      required: true
+      selector:
+        text: {}
+    value:
+      required: false
+      selector:
+        text: {}
+  sequence:
+    - variables:
+        domain: "{{ entity_id.split('.')[0] }}"
+        permitted: >-
+          {{ entity_id in label_entities('HMH_Device') or
+             (device_id(entity_id) is not none and device_id(entity_id) in label_devices('HMH_Device')) }}
+        num: "{{ value | default('0') | float(0) }}"
+    - if:
+        - condition: template
+          value_template: "{{ not (permitted | bool(false)) }}"
+      then:
+        - stop: "Dispositivo non etichettato HMH_Device"
+          error: true
+    - choose:
+        - conditions:
+            - condition: template
+              value_template: "{{ operation == 'toggle' and domain in ['light','switch','fan','input_boolean'] }}"
+          sequence:
+            - action: "{{ domain }}.toggle"
+              target:
+                entity_id: "{{ entity_id }}"
+        - conditions:
+            - condition: template
+              value_template: >-
+                {{ domain == 'light' and operation == 'brightness' and
+                   ((state_attr(entity_id,'supported_color_modes') or []) | reject('eq','onoff') | list | count > 0) }}
+          sequence:
+            - action: light.turn_on
+              target:
+                entity_id: "{{ entity_id }}"
+              data:
+                brightness_pct: "{{ [[num|float(0), 0] | max, 100] | min | round(0) | int }}"
+        - conditions:
+            - condition: template
+              value_template: >-
+                {{ domain == 'light' and operation == 'hue' and
+                   ((state_attr(entity_id,'supported_color_modes') or []) | select('in', ['hs','rgb','rgbw','rgbww','xy']) | list | count > 0) }}
+          sequence:
+            - action: light.turn_on
+              target:
+                entity_id: "{{ entity_id }}"
+              data:
+                hs_color: "{{ [num | float(0) | round(0) | int, (state_attr(entity_id,'hs_color') or [0,100])[1]] }}"
+        - conditions:
+            - condition: template
+              value_template: >-
+                {{ domain == 'light' and operation == 'saturation' and
+                   ((state_attr(entity_id,'supported_color_modes') or []) | select('in', ['hs','rgb','rgbw','rgbww','xy']) | list | count > 0) }}
+          sequence:
+            - action: light.turn_on
+              target:
+                entity_id: "{{ entity_id }}"
+              data:
+                hs_color: "{{ [(state_attr(entity_id,'hs_color') or [0,100])[0], [[num | float(100),0] | max,100] | min] }}"
+        - conditions:
+            - condition: template
+              value_template: "{{ domain == 'light' and operation == 'kelvin' and 'color_temp' in (state_attr(entity_id,'supported_color_modes') or []) }}"
+          sequence:
+            - action: light.turn_on
+              target:
+                entity_id: "{{ entity_id }}"
+              data:
+                color_temp_kelvin: >-
+                  {{ [[num | float(3000), state_attr(entity_id,'min_color_temp_kelvin') | float(2000)] | max,
+                       state_attr(entity_id,'max_color_temp_kelvin') | float(6500)] | min | int }}
+        - conditions:
+            - condition: template
+              value_template: "{{ domain == 'climate' and operation == 'target' and (state_attr(entity_id,'supported_features') | int(0)) % 2 == 1 }}"
+          sequence:
+            - action: climate.set_temperature
+              target:
+                entity_id: "{{ entity_id }}"
+              data:
+                temperature: >-
+                  {{ [[num | float(20), state_attr(entity_id,'min_temp') | float(7)] | max,
+                       state_attr(entity_id,'max_temp') | float(35)] | min }}
+        - conditions:
+            - condition: template
+              value_template: "{{ domain == 'climate' and operation == 'climate_mode' and value in (state_attr(entity_id,'hvac_modes') or []) }}"
+          sequence:
+            - action: climate.set_hvac_mode
+              target:
+                entity_id: "{{ entity_id }}"
+              data:
+                hvac_mode: "{{ value }}"
+        - conditions:
+            - condition: template
+              value_template: "{{ domain == 'cover' and operation == 'position' and ((state_attr(entity_id,'supported_features') | int(0)) // 4) % 2 == 1 }}"
+          sequence:
+            - action: cover.set_cover_position
+              target:
+                entity_id: "{{ entity_id }}"
+              data:
+                position: "{{ [[num | int(0), 0] | max, 100] | min }}"
+        - conditions:
+            - condition: template
+              value_template: >-
+                {{ domain == 'cover' and
+                   ((operation == 'open' and ((state_attr(entity_id,'supported_features')|int(0)) % 2 == 1)) or
+                    (operation == 'close' and ((state_attr(entity_id,'supported_features')|int(0)) // 2) % 2 == 1) or
+                    (operation == 'stop' and ((state_attr(entity_id,'supported_features')|int(0)) // 8) % 2 == 1)) }}
+          sequence:
+            - action: >-
+                {% if operation == 'open' %}cover.open_cover
+                {% elif operation == 'close' %}cover.close_cover
+                {% else %}cover.stop_cover{% endif %}
+              target:
+                entity_id: "{{ entity_id }}"
+        - conditions:
+            - condition: template
+              value_template: "{{ domain == 'fan' and operation == 'speed' and ((state_attr(entity_id,'supported_features') | int(0)) % 2 == 1) }}"
+          sequence:
+            - action: fan.set_percentage
+              target:
+                entity_id: "{{ entity_id }}"
+              data:
+                percentage: "{{ [[num | int(0), 0] | max, 100] | min }}"
+        - conditions:
+            - condition: template
+              value_template: "{{ domain == 'media_player' and operation == 'play_pause' }}"
+          sequence:
+            - action: media_player.media_play_pause
+              target:
+                entity_id: "{{ entity_id }}"
+        - conditions:
+            - condition: template
+              value_template: "{{ domain == 'media_player' and operation == 'volume' }}"
+          sequence:
+            - action: media_player.volume_set
+              target:
+                entity_id: "{{ entity_id }}"
+              data:
+                volume_level: "{{ ([[num | float(0), 0] | max, 100] | min) / 100 }}"
+        - conditions:
+            - condition: template
+              value_template: "{{ domain == 'media_player' and operation == 'mute' }}"
+          sequence:
+            - action: media_player.volume_mute
+              target:
+                entity_id: "{{ entity_id }}"
+              data:
+                is_volume_muted: "{{ not (state_attr(entity_id,'is_volume_muted') | bool(false)) }}"
+        - conditions:
+            - condition: template
+              value_template: "{{ operation == 'run' and domain in ['scene','script'] and entity_id in label_entities('HMH_Device') }}"
+          sequence:
+            - action: "{{ domain }}.turn_on"
+              target:
+                entity_id: "{{ entity_id }}"
+      default:
+        - stop: "Funzione non disponibile o comando non consentito"
+          error: true

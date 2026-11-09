@@ -1,0 +1,542 @@
+# HackMyHome Universal Knob v0.1.3 / ONX2424G013
+# Independent firmware; extracted ONX hardware map from Power Control 0.27.3.
+# Requires the three HA scripts in ../ha/hmh_knob_scripts.yaml.
+substitutions:
+  device_name: hmh-universal-knob
+  friendly_name: HMH Universal Knob
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  api_key: !secret api_encryption_key
+  lcd_clk: GPIO5
+  lcd_mosi: GPIO1
+  lcd_cs: GPIO2
+  lcd_dc: GPIO3
+  lcd_reset: GPIO8
+  lcd_backlight: GPIO6
+  encoder_a: GPIO48
+  encoder_b: GPIO47
+  encoder_key: GPIO9
+  # Tuning: higher value = less sensitive / fewer changes per second.
+  knob_min_step_ms: "180"
+  # Exit actions / edit and restore device browsing after inactivity.
+  knob_idle_return_ms: "6500"
+
+esphome:
+  name: ${device_name}
+  friendly_name: ${friendly_name}
+  comment: "HackMyHome 0.1.3 - dynamic HMH_Device pages / LVGL / OpenNextion"
+  includes:
+    - hmh_universal_knob.h
+
+esp32:
+  board: esp32-s3-devkitc-1
+  flash_size: 16MB
+  cpu_frequency: 240MHz
+  framework:
+    type: esp-idf
+
+psram:
+  mode: octal
+  speed: 80MHz
+
+logger:
+  level: INFO
+
+wifi:
+  ssid: ${ssid}
+  password: ${password}
+  reboot_timeout: 10min
+  on_disconnect:
+    - lambda: 'hmh_knob.ha_online = false;'
+    - script.execute: hmh_refresh_ui
+
+api:
+  id: hmh_api
+  encryption:
+    key: ${api_key}
+  on_client_connected:
+    - delay: 4s
+    - lambda: |-
+        hmh_knob.ha_online = id(hmh_api).is_connected_with_state_subscription();
+    - if:
+        condition:
+          lambda: 'return hmh_knob.ha_online;'
+        then:
+          - script.execute: hmh_load_catalog
+  on_client_disconnected:
+    - lambda: 'hmh_knob.ha_online = id(hmh_api).is_connected_with_state_subscription();'
+    - script.execute: hmh_refresh_ui
+
+ota:
+  - platform: esphome
+
+safe_mode:
+
+captive_portal:
+
+spi:
+  id: lcd_spi
+  clk_pin: ${lcd_clk}
+  mosi_pin: ${lcd_mosi}
+  interface: hardware
+
+display:
+  - platform: mipi_spi
+    id: main_display
+    model: GC9A01A
+    spi_id: lcd_spi
+    cs_pin: ${lcd_cs}
+    dc_pin: ${lcd_dc}
+    reset_pin: ${lcd_reset}
+    invert_colors: true
+    color_order: rgb
+    rotation: 0
+    auto_clear_enabled: false
+    update_interval: never
+    dimensions:
+      width: 240
+      height: 240
+
+# Lightweight icon assets (48x48, RGBA) packaged locally with the firmware.
+# RGB565 + alpha_channel supports antialiased edges and dynamic LVGL recoloring.
+image:
+  - platform: file
+    file: icons/light.png
+    id: hmh_asset_light
+    type: RGB565
+    transparency: alpha_channel
+  - platform: file
+    file: icons/switch.png
+    id: hmh_asset_switch
+    type: RGB565
+    transparency: alpha_channel
+  - platform: file
+    file: icons/climate.png
+    id: hmh_asset_climate
+    type: RGB565
+    transparency: alpha_channel
+  - platform: file
+    file: icons/cover.png
+    id: hmh_asset_cover
+    type: RGB565
+    transparency: alpha_channel
+  - platform: file
+    file: icons/fan.png
+    id: hmh_asset_fan
+    type: RGB565
+    transparency: alpha_channel
+  - platform: file
+    file: icons/media.png
+    id: hmh_asset_media
+    type: RGB565
+    transparency: alpha_channel
+  - platform: file
+    file: icons/scene.png
+    id: hmh_asset_scene
+    type: RGB565
+    transparency: alpha_channel
+  - platform: file
+    file: icons/sensor.png
+    id: hmh_asset_sensor
+    type: RGB565
+    transparency: alpha_channel
+  - platform: file
+    file: icons/generic.png
+    id: hmh_asset_generic
+    type: RGB565
+    transparency: alpha_channel
+
+output:
+  - platform: ledc
+    id: lcd_pwm
+    pin: ${lcd_backlight}
+    frequency: 1000Hz
+
+light:
+  - platform: monochromatic
+    id: lcd_backlight
+    name: "${friendly_name} Backlight"
+    output: lcd_pwm
+    restore_mode: ALWAYS_ON
+    default_transition_length: 0ms
+
+sensor:
+  - platform: wifi_signal
+    id: hmh_wifi_signal
+    name: "${friendly_name} WiFi"
+    update_interval: 60s
+  - platform: rotary_encoder
+    id: hmh_encoder
+    internal: true
+    pin_a:
+      number: ${encoder_a}
+      mode:
+        input: true
+        pullup: true
+    pin_b:
+      number: ${encoder_b}
+      mode:
+        input: true
+        pullup: true
+    resolution: 4
+    restore_mode: ALWAYS_ZERO
+    on_clockwise:
+      - if:
+          condition:
+            lambda: 'return hmh_knob.rotate(1, millis(), ${knob_min_step_ms}, ${knob_idle_return_ms});'
+          then:
+            - script.execute: hmh_refresh_ui
+            - if:
+                condition:
+                  lambda: 'return hmh_knob.ui_mode == 0;'
+                then:
+                  - script.execute: hmh_load_state
+    on_anticlockwise:
+      - if:
+          condition:
+            lambda: 'return hmh_knob.rotate(-1, millis(), ${knob_min_step_ms}, ${knob_idle_return_ms});'
+          then:
+            - script.execute: hmh_refresh_ui
+            - if:
+                condition:
+                  lambda: 'return hmh_knob.ui_mode == 0;'
+                then:
+                  - script.execute: hmh_load_state
+
+binary_sensor:
+  - platform: gpio
+    id: hmh_encoder_key
+    internal: true
+    pin:
+      number: ${encoder_key}
+      mode:
+        input: true
+        pullup: true
+      inverted: true
+    filters:
+      - delayed_on: 20ms
+      - delayed_off: 20ms
+    on_press:
+      - lambda: |-
+          id(hmh_press_started) = millis();
+          hmh_knob.note_interaction();
+    on_release:
+      - if:
+          condition:
+            lambda: 'return (uint32_t)(millis() - id(hmh_press_started)) >= 650u;'
+          then:
+            - lambda: 'hmh_knob.back();'
+          else:
+            - lambda: 'hmh_knob.click();'
+            - script.execute: hmh_send_command
+      - script.execute: hmh_refresh_ui
+
+globals:
+  - id: hmh_press_started
+    type: uint32_t
+    initial_value: '0'
+
+button:
+  - platform: template
+    name: "${friendly_name} Aggiorna catalogo"
+    on_press:
+      - script.execute: hmh_load_catalog
+
+script:
+  # All entity discovery and state retrieval happens in Home Assistant scripts.
+  # No long-lived access token and no fixed entity IDs stored on the knob.
+  - id: hmh_load_catalog
+    mode: single
+    then:
+      - if:
+          condition:
+            lambda: 'return hmh_knob.ha_online;'
+          then:
+            - homeassistant.action:
+                action: script.hmh_knob_catalog
+                capture_response: true
+                on_success:
+                  - lambda: |-
+                      const char *payload = response["response"]["payload"].as<const char *>();
+                      if (payload) hmh_knob.load_catalog(payload);
+                      else hmh_knob.error = "RISPOSTA CATALOGO VUOTA";
+                  - script.execute: hmh_refresh_ui
+                  - script.execute: hmh_load_state
+                on_error:
+                  - lambda: 'hmh_knob.error = "ERRORE SCRIPT CATALOGO";'
+                  - script.execute: hmh_refresh_ui
+
+  - id: hmh_load_state
+    mode: restart
+    then:
+      - if:
+          condition:
+            lambda: 'return hmh_knob.ha_online && hmh_knob.selected() != nullptr;'
+          then:
+            - homeassistant.action:
+                action: script.hmh_knob_state
+                data_template:
+                  entity_id: "{{ target }}"
+                variables:
+                  target: !lambda 'return hmh_knob.selected()->entity;'
+                capture_response: true
+                on_success:
+                  - lambda: |-
+                      const char *payload = response["response"]["payload"].as<const char *>();
+                      if (payload) hmh_knob.load_state(payload);
+                      else hmh_knob.error = "RISPOSTA STATO VUOTA";
+                  - script.execute: hmh_refresh_ui
+                on_error:
+                  - lambda: 'hmh_knob.error = "ERRORE LETTURA STATO";'
+                  - script.execute: hmh_refresh_ui
+
+  - id: hmh_send_command
+    mode: queued
+    max_runs: 2
+    then:
+      - if:
+          condition:
+            lambda: 'return hmh_knob.pending && hmh_knob.ha_online;'
+          then:
+            - lambda: 'hmh_knob.stage_send();'
+            - homeassistant.action:
+                action: script.hmh_knob_command
+                data_template:
+                  entity_id: "{{ entity }}"
+                  operation: "{{ operation }}"
+                  value: "{{ value }}"
+                variables:
+                  entity: !lambda 'return hmh_knob.tx_entity;'
+                  operation: !lambda 'return hmh_knob.tx_op;'
+                  value: !lambda 'return hmh_knob.tx_value;'
+                on_success:
+                  - delay: 500ms
+                  - script.execute: hmh_load_state
+                on_error:
+                  - lambda: 'hmh_knob.error = "COMANDO NON INVIATO";'
+                  - script.execute: hmh_refresh_ui
+
+  - id: hmh_refresh_ui
+    mode: restart
+    then:
+      - lambda: |-
+          hmh_knob.render(id(hmh_name), id(hmh_counter), id(hmh_type),
+                          id(hmh_value), id(hmh_field), id(hmh_info),
+                          id(hmh_hint), id(hmh_bar), id(hmh_icon_disk),
+                          {id(hmh_icon_light), id(hmh_icon_switch), id(hmh_icon_climate),
+                           id(hmh_icon_cover), id(hmh_icon_fan), id(hmh_icon_media),
+                           id(hmh_icon_scene), id(hmh_icon_sensor), id(hmh_icon_generic)});
+
+interval:
+  # Idle return is checked independently of HA polling and the refresh cycle.
+  # A pending adjustment is discarded; no command is sent on timeout.
+  - interval: 500ms
+    then:
+      - if:
+          condition:
+            lambda: 'return hmh_knob.return_to_browse_if_idle(millis(), ${knob_idle_return_ms});'
+          then:
+            - script.execute: hmh_refresh_ui
+  - interval: 30s
+    then:
+      - lambda: 'hmh_knob.ha_online = id(hmh_api).is_connected_with_state_subscription();'
+      - script.execute: hmh_load_catalog
+  - interval: 3s
+    then:
+      - if:
+          condition:
+            lambda: 'return hmh_knob.ha_online && hmh_knob.selected() != nullptr;'
+          then:
+            - script.execute: hmh_load_state
+
+lvgl:
+  id: hmh_lvgl
+  displays:
+    - main_display
+  log_level: WARN
+  color_depth: 16
+  buffer_size: 20%
+  on_boot:
+    then:
+      - script.execute: hmh_refresh_ui
+  pages:
+    - id: hmh_main_page
+      scrollable: false
+      bg_color: 0x020617
+      bg_opa: COVER
+      widgets:
+        - label:
+            text: "HACKMYHOME"
+            align: TOP_MID
+            y: 9
+            text_font: montserrat_10
+            text_color: 0x38BDF8
+        - label:
+            id: hmh_name
+            text: "HMH UNIVERSAL KNOB"
+            align: TOP_MID
+            y: 28
+            width: 190
+            text_align: CENTER
+            text_font: montserrat_10
+            text_color: 0xF8FAFC
+            long_mode: DOT
+        - label:
+            id: hmh_counter
+            text: "-- / --"
+            align: TOP_MID
+            y: 47
+            text_font: montserrat_10
+            text_color: 0x64748B
+        - label:
+            id: hmh_type
+            text: "IN ATTESA..."
+            align: TOP_MID
+            y: 65
+            text_font: montserrat_10
+            text_color: 0x94A3B8
+        # Center icon disc (120,120) on a 240x240 circular screen.
+        - obj:
+            id: hmh_icon_disk
+            align: TOP_MID
+            y: 82
+            width: 76
+            height: 76
+            radius: 38
+            bg_color: 0x0F172A
+            border_color: 0x334155
+            border_width: 2
+            pad_all: 0
+            scrollable: false
+            clickable: false
+        - image:
+            id: hmh_icon_light
+            src: hmh_asset_light
+            align: TOP_MID
+            y: 96
+            hidden: true
+            clickable: false
+            image_recolor: 0x64748B
+            image_recolor_opa: COVER
+        - image:
+            id: hmh_icon_switch
+            src: hmh_asset_switch
+            align: TOP_MID
+            y: 96
+            hidden: true
+            clickable: false
+            image_recolor: 0x64748B
+            image_recolor_opa: COVER
+        - image:
+            id: hmh_icon_climate
+            src: hmh_asset_climate
+            align: TOP_MID
+            y: 96
+            hidden: true
+            clickable: false
+            image_recolor: 0x64748B
+            image_recolor_opa: COVER
+        - image:
+            id: hmh_icon_cover
+            src: hmh_asset_cover
+            align: TOP_MID
+            y: 96
+            hidden: true
+            clickable: false
+            image_recolor: 0x64748B
+            image_recolor_opa: COVER
+        - image:
+            id: hmh_icon_fan
+            src: hmh_asset_fan
+            align: TOP_MID
+            y: 96
+            hidden: true
+            clickable: false
+            image_recolor: 0x64748B
+            image_recolor_opa: COVER
+        - image:
+            id: hmh_icon_media
+            src: hmh_asset_media
+            align: TOP_MID
+            y: 96
+            hidden: true
+            clickable: false
+            image_recolor: 0x64748B
+            image_recolor_opa: COVER
+        - image:
+            id: hmh_icon_scene
+            src: hmh_asset_scene
+            align: TOP_MID
+            y: 96
+            hidden: true
+            clickable: false
+            image_recolor: 0x64748B
+            image_recolor_opa: COVER
+        - image:
+            id: hmh_icon_sensor
+            src: hmh_asset_sensor
+            align: TOP_MID
+            y: 96
+            hidden: true
+            clickable: false
+            image_recolor: 0x64748B
+            image_recolor_opa: COVER
+        - image:
+            id: hmh_icon_generic
+            src: hmh_asset_generic
+            align: TOP_MID
+            y: 96
+            hidden: true
+            clickable: false
+            image_recolor: 0x64748B
+            image_recolor_opa: COVER
+        - label:
+            id: hmh_value
+            text: "--"
+            align: TOP_MID
+            y: 160
+            width: 172
+            text_align: CENTER
+            text_font: montserrat_24
+            text_color: 0xF8FAFC
+            long_mode: DOT
+        - label:
+            id: hmh_field
+            text: "DISPOSITIVO"
+            align: TOP_MID
+            y: 189
+            text_font: montserrat_10
+            text_color: 0x38BDF8
+        - bar:
+            id: hmh_bar
+            x: 65
+            y: 204
+            width: 110
+            height: 7
+            min_value: 0
+            max_value: 100
+            value: 0
+            radius: 4
+            bg_color: 0x1E293B
+            indicator:
+              bg_color: 0x38BDF8
+        - label:
+            id: hmh_info
+            text: "Caricamento..."
+            align: TOP_MID
+            y: 214
+            width: 154
+            text_align: CENTER
+            text_font: montserrat_10
+            text_color: 0xCBD5E1
+            long_mode: DOT
+        - label:
+            id: hmh_hint
+            text: "RUOTA / PREMI"
+            align: TOP_MID
+            y: 229
+            width: 112
+            text_align: CENTER
+            text_font: montserrat_10
+            text_color: 0x64748B
+            long_mode: DOT

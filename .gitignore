@@ -1,0 +1,14 @@
+# Credenziali e file locali
+secrets.yaml
+**/secrets.yaml
+.env
+.env.*
+!*.example
+
+# Build / cache
+.esphome/
+.pio/
+__pycache__/
+*.py[cod]
+.DS_Store
+Thumbs.db
